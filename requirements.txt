@@ -1,0 +1,9 @@
+numpy
+Flask
+flask-pymongo
+bson
+librosa
+werkzeug
+python-dotenv
+vosk
+soundfile
