@@ -1,5 +1,4 @@
 venv/
 uploads/
-model/
 .env
 speaker-verification-90881-firebase-adminsdk-2grmb-834541434d.json
