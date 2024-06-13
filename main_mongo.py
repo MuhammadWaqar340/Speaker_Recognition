@@ -1,4 +1,5 @@
 import shutil
+import sys
 from flask import Flask, jsonify, request
 from flask_pymongo import PyMongo
 from bson.objectid import ObjectId
@@ -10,6 +11,10 @@ from datetime import datetime
 import numpy as np
 import noisereduce as nr
 from dotenv import load_dotenv
+import wave
+import json
+from vosk import Model, KaldiRecognizer, SpkModel
+
 
 # Init App
 app = Flask(__name__)
@@ -203,10 +208,186 @@ def upload_file():
     return jsonify(item), 201
 
 
+##################################################################################################
+
+# initializing Model
+SPK_MODEL_PATH = "./model/vosk-model-spk-0.4"
+
+if not os.path.exists(SPK_MODEL_PATH):
+    sys.exit(1)
+
+model = Model(lang="en")
+spk_model = SpkModel(SPK_MODEL_PATH)
+
+
+# Function to calculate cosine distance
+def cosine_dist(x, y):
+    nx = np.array(x)
+    ny = np.array(y)
+    return round(1 - np.dot(nx, ny) / np.linalg.norm(nx) / np.linalg.norm(ny), 1)
+
+
+# Request
+@app.route("/api/verify", methods=["POST"])
+def verify_speaker():
+    if "audio_file" not in request.files:
+        return jsonify({"error": "No audio file found"}), 400
+
+    if "folder_id" not in request.form:
+        return jsonify({"error": "No folder_id provided"}), 400
+
+    audio_file = request.files["audio_file"]
+    folder_id = request.form["folder_id"]
+
+    # Check if the uploaded file has an allowed extension
+    if not allowed_file(audio_file.filename):
+        return jsonify({"error": "Only audio files are allowed"}), 400
+
+    # Generate a unique filename
+    filename = secure_filename(audio_file.filename)
+    filename_without_extension, extension = os.path.splitext(filename)
+    unique_filename = f"{filename_without_extension}_{datetime.now().strftime('%Y%m%d%H%M%S%f')}{extension}"
+    audio_path = os.path.join("/tmp", unique_filename)
+    audio_file.save(audio_path)
+
+    # Check if file needs to be converted to WAV
+    if not audio_path.lower().endswith(".wav"):
+        try:
+            audio_data, sr = librosa.load(audio_path, sr=None)
+            wav_filename = os.path.splitext(unique_filename)[0] + ".wav"
+            wav_filepath = os.path.join("/tmp", wav_filename)
+            sf.write(wav_filepath, audio_data, sr)
+
+            # Remove the original non-wav file
+            os.remove(audio_path)
+            audio_path = wav_filepath
+        except Exception as e:
+            return jsonify(
+                {
+                    "error": f"Failed to convert file {audio_file.filename}. Error: {str(e)}"
+                }
+            ), 500
+
+    # Apply noise reduction
+    try:
+        noise_reduction(audio_path)
+    except Exception as e:
+        return jsonify(
+            {"error": f"Failed to apply noise reduction. Error: {str(e)}"}
+        ), 500
+
+    # Load the audio file
+    try:
+        wf = wave.open(audio_path, "rb")
+    except wave.Error as e:
+        return jsonify({"error": f"Failed to load audio file. Error: {str(e)}"}), 400
+
+    if wf.getnchannels() != 1 or wf.getsampwidth() != 2 or wf.getcomptype() != "NONE":
+        return jsonify({"error": "Audio file must be WAV format mono PCM"}), 400
+
+    # Initialize recognizer
+    rec = KaldiRecognizer(model, wf.getframerate())
+    rec.SetSpkModel(spk_model)
+
+    # Initialize an empty list to store x-vector embeddings for the uploaded file
+    x_vectors = []
+
+    # Loop over the audio file and accumulate x-vector embeddings
+    while True:
+        data = wf.readframes(4000)
+        if len(data) == 0:
+            break
+        if rec.AcceptWaveform(data):
+            res = json.loads(rec.Result())
+            if "spk" in res:
+                x_vectors.append(res["spk"])
+
+    # Compute the average x-vector for the uploaded file
+    if not x_vectors:
+        return jsonify({"error": "No x-vectors found in the audio file"}), 400
+
+    avg_x_vector = np.mean(x_vectors, axis=0)
+
+    # Retrieve file paths from the database
+    user_data = mongo.db.files.find_one({"folder_id": folder_id})
+    if not user_data:
+        return jsonify({"error": "folder_id not found"}), 404
+
+    file_paths = [file["file_path"] for file in user_data["files"]]
+
+    cosine_distances = {}
+    valid_distances_count = 0
+
+    # Calculate cosine distances for each file in the folder
+    for file_path in file_paths:
+        # Load each audio file
+        try:
+            wf = wave.open(file_path, "rb")
+        except wave.Error as e:
+            return jsonify(
+                {"error": f"Failed to load audio file from folder. Error: {str(e)}"}
+            ), 400
+
+        if (
+            wf.getnchannels() != 1
+            or wf.getsampwidth() != 2
+            or wf.getcomptype() != "NONE"
+        ):
+            return jsonify({"error": "Audio file must be WAV format mono PCM"}), 400
+
+        # Initialize recognizer
+        rec = KaldiRecognizer(model, wf.getframerate())
+        rec.SetSpkModel(spk_model)
+
+        # Initialize an empty list to store x-vector embeddings for the file in the folder
+        folder_x_vectors = []
+
+        # Loop over the audio file and accumulate x-vector embeddings
+        while True:
+            data = wf.readframes(4000)
+            if len(data) == 0:
+                break
+            if rec.AcceptWaveform(data):
+                res = json.loads(rec.Result())
+                if "spk" in res:
+                    folder_x_vectors.append(res["spk"])
+
+        # Compute the average x-vector for the file in the folder
+        if not folder_x_vectors:
+            return jsonify(
+                {"error": f"No x-vectors found in the audio file: {file_path}"}
+            ), 400
+
+        avg_folder_x_vector = np.mean(folder_x_vectors, axis=0)
+
+        # Calculate cosine distance
+        speaker_distance = cosine_dist(avg_x_vector, avg_folder_x_vector)
+        cosine_distances[file_path] = speaker_distance
+
+        # Count valid distances
+        if 0.0 <= speaker_distance <= 0.5:
+            valid_distances_count += 1
+
+    verification_result = (
+        "Successfully Verified!"
+        if valid_distances_count >= 2
+        else "Speaker Not Verified"
+    )
+
+    response = {
+        "verification_result": verification_result,
+        "cosine_distances": cosine_distances,
+    }
+
+    return jsonify(response), 200
+
+
+#####################################################################################################
+
 # Run Server
 if __name__ == "__main__":
     app.run(debug=True)
-
+#####################################################################################################
 
 # import os
 # import shutil
