@@ -211,7 +211,7 @@ def upload_file():
 ##################################################################################################
 
 # initializing Model
-SPK_MODEL_PATH = "./model/vosk-model-spk-0.4"
+SPK_MODEL_PATH = os.environ.get("Speaker_Verification_Model")
 
 if not os.path.exists(SPK_MODEL_PATH):
     sys.exit(1)
